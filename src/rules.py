@@ -1,6 +1,11 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
+
+
+ACTIVE_ALARM_STATUSES = {"received", "dispatched", "resolved"}
+ACTIVE_RESCUE_STATUSES = {"dispatched", "on_site"}
+TERMINAL_ALARM_STATUSES = {"closed", "false_alarm"}
 
 
 def _require(data, fields):
@@ -22,6 +27,93 @@ def _all(lookup, kind):
 def _find_one(lookup, kind, field, value):
     rows = lookup(kind, field, value) or [] if lookup else []
     return rows[0] if rows else None
+
+
+def _parse_utc(value, field):
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        raise ValidationError(field + " must be ISO-8601")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _equipment_alarms(lookup, equipment_id):
+    return [
+        alarm
+        for alarm in _all(lookup, "alarm")
+        if alarm["data"].get("equipment_id") == equipment_id
+    ]
+
+
+def _active_safety_block(lookup, equipment_id, exclude_alarm_id=None):
+    """Return the alarm/rescue that must keep the equipment safety-locked."""
+    alarms = _equipment_alarms(lookup, equipment_id)
+    alarm_by_id = {alarm["id"]: alarm for alarm in alarms}
+    active_alarms = [
+        alarm for alarm in alarms
+        if alarm["id"] != exclude_alarm_id and alarm["status"] in ACTIVE_ALARM_STATUSES
+    ]
+    if active_alarms:
+        alarm = sorted(active_alarms, key=lambda item: item["created_at"] + item["id"])[0]
+        return {"type": "alarm", "alarm": alarm}
+
+    jobs = [
+        job for job in _all(lookup, "rescue_job")
+        if job["status"] in ACTIVE_RESCUE_STATUSES
+        and job["data"].get("alarm_id") in alarm_by_id
+    ]
+    if jobs:
+        job = sorted(jobs, key=lambda item: item["created_at"] + item["id"])[0]
+        return {"type": "rescue", "alarm": alarm_by_id[job["data"].get("alarm_id")], "job": job}
+    return None
+
+
+def _ensure_not_safety_locked(lookup, equipment_id, label, exclude_alarm_id=None):
+    block = _active_safety_block(lookup, equipment_id, exclude_alarm_id=exclude_alarm_id)
+    if block:
+        alarm = block["alarm"]
+        alarm_id = alarm["id"]
+        code = alarm["data"].get("code") or alarm["status"]
+        if block["type"] == "rescue":
+            raise ConflictError(
+                "%s blocked by active rescue job %s for alarm %s (%s)"
+                % (label, block["job"]["id"], alarm_id, code)
+            )
+        raise ConflictError("%s blocked by active alarm %s (%s)" % (label, alarm_id, code))
+
+
+def _ensure_recovery_ready(lookup, equipment_id, label, exclude_alarm_id=None):
+    _ensure_not_safety_locked(lookup, equipment_id, label, exclude_alarm_id=exclude_alarm_id)
+    required_alarm = _requires_release_inspection(lookup, equipment_id)
+    if required_alarm:
+        raise ConflictError(
+            "%s blocked until a qualified inspection passes after alarm %s is released"
+            % (label, required_alarm["id"])
+        )
+
+
+def _requires_release_inspection(lookup, equipment_id):
+    alarms = [
+        alarm for alarm in _equipment_alarms(lookup, equipment_id)
+        if alarm["status"] == "closed"
+    ]
+    if not alarms:
+        return None
+    latest_closed = sorted(alarms, key=lambda item: (item["data"].get("released_at") or item["updated_at"], item["id"]))[-1]
+    inspections = [
+        inspection
+        for inspection in _all(lookup, "inspection")
+        if inspection["data"].get("equipment_id") == equipment_id
+        and inspection["status"] == "passed"
+    ]
+    released_at = _parse_utc(latest_closed["data"].get("released_at") or latest_closed["updated_at"], "released_at")
+    for inspection in inspections:
+        passed_at = inspection["data"].get("passed_at") or inspection["updated_at"]
+        if _parse_utc(passed_at, "passed_at") > released_at:
+            return None
+    return latest_closed
 
 
 def _positive(value, field):
@@ -55,8 +147,10 @@ def _validate_inspection(data, lookup):
 
 
 def _validate_maintenance(data, lookup):
-    if not _find_one(lookup, "equipment", "id", data.get("equipment_id")):
+    equipment = _find_one(lookup, "equipment", "id", data.get("equipment_id"))
+    if not equipment:
         raise ValidationError("maintenance requires equipment")
+    _ensure_recovery_ready(lookup, equipment["id"], "maintenance")
     if data.get("work_type") not in ("routine", "repair", "component_replacement", "modernization"):
         raise ValidationError("invalid work_type")
     if data.get("work_type") == "component_replacement" and not data.get("part_serial"):
@@ -77,7 +171,7 @@ def _validate_alarm(data, lookup):
 
 def _validate_rescue(data, lookup):
     alarm = _find_one(lookup, "alarm", "id", data.get("alarm_id"))
-    if not alarm or alarm["status"] == "closed":
+    if not alarm or alarm["status"] in TERMINAL_ALARM_STATUSES:
         raise ValidationError("rescue_job requires an active alarm")
     key = data.get("dedupe_key")
     for job in _all(lookup, "rescue_job"):
@@ -95,20 +189,72 @@ def _validate_remediation(data, lookup):
 
 
 def _validate_permit(data, lookup):
-    if not _find_one(lookup, "equipment", "id", data.get("equipment_id")):
+    equipment = _find_one(lookup, "equipment", "id", data.get("equipment_id"))
+    if not equipment:
         raise ValidationError("permit requires equipment")
+    _ensure_recovery_ready(lookup, equipment["id"], "permit application")
     if data.get("purpose") not in ("return_to_service", "special_inspection", "temporary_operation"):
         raise ValidationError("invalid permit purpose")
 
 
+def _request_permit_review(actor, entity, data, lookup):
+    _ensure_recovery_ready(lookup, entity["data"].get("equipment_id"), "permit application")
+    return {}
+
+
+def _return_equipment_to_service(actor, entity, data, lookup):
+    _ensure_not_safety_locked(lookup, entity["id"], "equipment return to service")
+    patch = {}
+    if entity["data"].get("recovery_required_alarm_id"):
+        permits = [
+            permit
+            for permit in _all(lookup, "permit")
+            if permit["data"].get("equipment_id") == entity["id"]
+        ]
+        if not any(permit["status"] == "granted" for permit in permits):
+            raise ConflictError("return to service requires a granted recovery permit")
+        patch["recovery_required_alarm_id"] = None
+        patch["pre_lock_status"] = None
+    return patch
+
+
+def _pass_inspection(actor, entity, data, lookup):
+    return {
+        "passed_by": actor.user_id,
+        "passed_at": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+    }
+
+
+def _start_maintenance(actor, entity, data, lookup):
+    _ensure_recovery_ready(lookup, entity["data"].get("equipment_id"), "maintenance start")
+    return {}
+
+
+def _complete_maintenance(actor, entity, data, lookup):
+    _ensure_recovery_ready(lookup, entity["data"].get("equipment_id"), "maintenance completion")
+    return {}
+
+
+def _mark_alarm_terminal(actor, entity, data, lookup):
+    return {"released_at": datetime.now(timezone.utc).isoformat(timespec="microseconds")}
+
+
 def _grant_permit(actor, entity, data, lookup):
-    equipment = _find_one(lookup, "equipment", "id", entity["data"].get("equipment_id"))
-    if not equipment or equipment["status"] not in ("in_service", "suspended"):
+    equipment_id = entity["data"].get("equipment_id")
+    _ensure_not_safety_locked(lookup, equipment_id, "permit grant")
+    equipment = _find_one(lookup, "equipment", "id", equipment_id)
+    if not equipment or equipment["status"] not in ("in_service", "suspended", "out_of_service"):
         raise ConflictError("permit can only be granted for a serviceable equipment")
-    inspections = [i for i in _all(lookup, "inspection") if i["data"].get("equipment_id") == equipment["id"] and i["status"] == "passed"]
+    required_alarm = _requires_release_inspection(lookup, equipment_id)
+    if required_alarm:
+        raise ConflictError(
+            "permit requires a passed inspection after alarm %s was released"
+            % required_alarm["id"]
+        )
+    inspections = [i for i in _all(lookup, "inspection") if i["data"].get("equipment_id") == equipment_id and i["status"] == "passed"]
     if not inspections:
         raise ConflictError("permit requires a passed inspection")
-    if [r for r in _all(lookup, "remediation") if r["data"].get("equipment_id") == equipment["id"] and r["status"] != "closed"]:
+    if [r for r in _all(lookup, "remediation") if r["data"].get("equipment_id") == equipment_id and r["status"] != "closed"]:
         raise ConflictError("permit blocked by open remediation")
     return {"granted_by": actor.user_id, "granted_at": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
 
@@ -126,7 +272,16 @@ def _complete_rescue(actor, entity, data, lookup):
     return {"resolved_by": actor.user_id}
 
 
+def _close_alarm(actor, entity, data, lookup):
+    patch = _complete_rescue(actor, entity, data, lookup)
+    patch.update(_mark_alarm_terminal(actor, entity, data, lookup))
+    return patch
+
+
 class RuleEngine:
+    ACTIVE_ALARM_STATUSES = ACTIVE_ALARM_STATUSES
+    ACTIVE_RESCUE_STATUSES = ACTIVE_RESCUE_STATUSES
+    TERMINAL_ALARM_STATUSES = TERMINAL_ALARM_STATUSES
     ALIASES = {
         "equipments": "equipment", "inspections": "inspection", "maintenances": "maintenance",
         "alarms": "alarm", "rescue_jobs": "rescue_job", "remediations": "remediation",
@@ -141,7 +296,7 @@ class RuleEngine:
         "equipment": {
             "suspend": (("in_service",), "suspended"),
             "out_of_service": (("in_service", "suspended"), "out_of_service"),
-            "return_to_service": (("suspended",), "in_service"),
+            "return_to_service": (("suspended", "out_of_service"), "in_service"),
         },
         "inspection": {
             "pass": (("scheduled",), "passed"),
@@ -236,9 +391,15 @@ class RuleEngine:
         "permit": lambda a, d, l: _validate_permit(d, l),
     }
     CUSTOM_TRANSITIONS = {
+        ("equipment", "return_to_service"): _return_equipment_to_service,
+        ("inspection", "pass"): _pass_inspection,
+        ("maintenance", "start"): _start_maintenance,
+        ("maintenance", "complete"): _complete_maintenance,
+        ("permit", "request_review"): _request_permit_review,
         ("permit", "grant"): _grant_permit,
         ("remediation", "verify"): _verify_remediation,
-        ("alarm", "close"): _complete_rescue,
+        ("alarm", "close"): _close_alarm,
+        ("alarm", "mark_false"): _mark_alarm_terminal,
     }
 
     def normalize_kind(self, kind):
