@@ -29,34 +29,123 @@ class DomainService:
                     return entity
         self.rules.validate_create(actor, kind, payload, self._lookup)
         entity_id = str(payload.pop("id", "") or uuid4())
-        if self.repository.get_entity(entity_id):
+        existing_entity = self.repository.get_entity(entity_id)
+        if existing_entity:
             raise ConflictError("entity already exists: " + entity_id)
         status = self.rules.initial_status(kind, payload)
-        entity = self.repository.create_entity(entity_id, kind, status, payload, actor.user_id)
-        self.audit.record(entity_id, actor, "create", None, status, {"kind": kind})
+        preview = {
+            "id": entity_id,
+            "kind": kind,
+            "status": status,
+            "version": 1,
+            "data": payload,
+            "created_by": actor.user_id,
+        }
+        effects = self.rules.create_side_effects(kind, preview, self._lookup)
+        if effects:
+            self._apply_create_effects(actor, preview, effects)
+            entity = self.repository.get_entity(entity_id)
+        else:
+            entity = self.repository.create_entity(entity_id, kind, status, payload, actor.user_id)
+            self.audit.record(entity_id, actor, "create", None, entity["status"], {"kind": kind})
         if idempotency_key:
             self.repository.save_idempotency(actor.user_id, idempotency_key, entity_id)
         return entity
+
+    def _apply_create_effects(self, actor, entity, effects):
+        with self.repository.transaction() as connection:
+            self.repository._create_row(
+                connection,
+                entity["id"],
+                entity["kind"],
+                entity["status"],
+                entity["data"],
+                entity["created_by"],
+            )
+            self.repository._append_audit_row(
+                connection,
+                entity["id"],
+                actor.user_id,
+                actor.role,
+                "create",
+                None,
+                entity["status"],
+                {"kind": entity["kind"]},
+            )
+            for effect in effects:
+                target = effect["entity"]
+                self.repository._update_row(
+                    connection,
+                    target["id"],
+                    target["version"],
+                    effect["status"],
+                    effect["data"],
+                )
+                self.repository._append_audit_row(
+                    connection,
+                    target["id"],
+                    actor.user_id,
+                    actor.role,
+                    effect["action"],
+                    target["status"],
+                    effect["status"],
+                    effect.get("detail", {}),
+                )
+        return self.repository.get_entity(entity["id"])
 
     def transition(self, actor, entity_id, action, data=None, expected_version=None):
         entity = self.repository.get_entity(entity_id)
         if not entity:
             raise NotFoundError("entity not found: " + entity_id)
         expected = int(expected_version) if expected_version is not None else entity["version"]
-        next_status, patch = self.rules.validate_transition(
+        next_status, patch, effects = self.rules.validate_transition(
             actor, entity, action, dict(data or {}), self._lookup
         )
         merged = dict(entity["data"])
         merged.update(patch)
-        updated = self.repository.update_entity(entity_id, expected, next_status, merged)
-        self.audit.record(
-            entity_id,
-            actor,
-            action,
-            entity["status"],
-            updated["status"],
-            {"patch": patch},
-        )
+        if effects:
+            with self.repository.transaction() as connection:
+                self.repository._update_row(connection, entity_id, expected, next_status, merged)
+                self.repository._append_audit_row(
+                    connection,
+                    entity_id,
+                    actor.user_id,
+                    actor.role,
+                    action,
+                    entity["status"],
+                    next_status,
+                    {"patch": patch},
+                )
+                for effect in effects:
+                    target = effect["entity"]
+                    self.repository._update_row(
+                        connection,
+                        target["id"],
+                        target["version"],
+                        effect["status"],
+                        effect["data"],
+                    )
+                    self.repository._append_audit_row(
+                        connection,
+                        target["id"],
+                        actor.user_id,
+                        actor.role,
+                        effect["action"],
+                        target["status"],
+                        effect["status"],
+                        effect.get("detail", {}),
+                    )
+            updated = self.repository.get_entity(entity_id)
+        else:
+            updated = self.repository.update_entity(entity_id, expected, next_status, merged)
+            self.audit.record(
+                entity_id,
+                actor,
+                action,
+                entity["status"],
+                updated["status"],
+                {"patch": patch},
+            )
         return updated
 
     def merge_offline(self, actor, records):

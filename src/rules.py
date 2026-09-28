@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
 
@@ -55,12 +55,14 @@ def _validate_inspection(data, lookup):
 
 
 def _validate_maintenance(data, lookup):
-    if not _find_one(lookup, "equipment", "id", data.get("equipment_id")):
+    equipment = _equipment_by_id(lookup, data.get("equipment_id"))
+    if not equipment:
         raise ValidationError("maintenance requires equipment")
     if data.get("work_type") not in ("routine", "repair", "component_replacement", "modernization"):
         raise ValidationError("invalid work_type")
     if data.get("work_type") == "component_replacement" and not data.get("part_serial"):
         raise ValidationError("part_serial is required for component replacement")
+    _require_no_active_alarm(data.get("equipment_id"), lookup, "maintenance request")
 
 
 def _validate_alarm(data, lookup):
@@ -77,7 +79,7 @@ def _validate_alarm(data, lookup):
 
 def _validate_rescue(data, lookup):
     alarm = _find_one(lookup, "alarm", "id", data.get("alarm_id"))
-    if not alarm or alarm["status"] == "closed":
+    if not alarm or alarm["status"] in ("closed", "false_alarm"):
         raise ValidationError("rescue_job requires an active alarm")
     key = data.get("dedupe_key")
     for job in _all(lookup, "rescue_job"):
@@ -94,36 +96,344 @@ def _validate_remediation(data, lookup):
             raise ConflictError("open remediation already exists for issue")
 
 
+def _equipment_by_id(lookup, equipment_id):
+    return _find_one(lookup, "equipment", "id", equipment_id)
+
+
+def _active_alarms(lookup, equipment_id, exclude_id=None):
+    return [
+        alarm
+        for alarm in _all(lookup, "alarm")
+        if alarm["data"].get("equipment_id") == equipment_id
+        and alarm["id"] != exclude_id
+        and alarm["status"] not in ("closed", "false_alarm")
+    ]
+
+
+def _blocking_alarm(lookup, equipment_id, exclude_id=None):
+    alarms = _active_alarms(lookup, equipment_id, exclude_id)
+    if not alarms:
+        return None
+    return sorted(
+        alarms,
+        key=lambda alarm: (str(alarm["data"].get("occurred_at", "")), alarm["id"]),
+    )[0]
+
+
+def _require_no_active_alarm(equipment_id, lookup, action, exclude_id=None):
+    alarm = _blocking_alarm(lookup, equipment_id, exclude_id)
+    if alarm:
+        raise ConflictError(
+            "%s blocked by active alarm %s"
+            % (action, alarm["id"])
+        )
+    return alarm
+
+
+def _safety_lock(equipment):
+    lock = dict(equipment["data"].get("safety_lock") or {})
+    lock.setdefault("alarm_ids", [])
+    return lock
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _parse_iso(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _alarm_locks_equipment(equipment, alarm, lookup, at=None):
+    at = at or _now_iso()
+    lock = _safety_lock(equipment)
+    if not lock.get("active") and not lock.get("requires_recovery"):
+        lock.update(
+            {
+                "active": True,
+                "previous_status": equipment["status"],
+                "locked_at": at,
+                "alarm_ids": [alarm["id"]],
+                "recovery_alarm_ids": [],
+            }
+        )
+        lock.pop("requires_recovery", None)
+        lock.pop("recovery_required_at", None)
+    else:
+        if alarm["id"] not in lock["alarm_ids"]:
+            lock["alarm_ids"].append(alarm["id"])
+            lock["alarm_ids"].sort()
+        lock["active"] = True
+        lock.pop("requires_recovery", None)
+        lock.pop("recovery_required_at", None)
+    return lock
+
+def _alarm_create_effects(equipment_id, alarm, lookup):
+    equipment = _equipment_by_id(lookup, equipment_id)
+    if not equipment:
+        return [], equipment
+    effects = []
+    lock = _alarm_locks_equipment(equipment, alarm, lookup)
+    equipment_data = dict(equipment["data"])
+    equipment_data["safety_lock"] = lock
+    if equipment["status"] != "out_of_service":
+        effects.append(
+            {
+                "entity": equipment,
+                "status": "out_of_service",
+                "data": equipment_data,
+                "action": "safety_lock",
+                "detail": {"alarm_id": alarm["id"]},
+            }
+        )
+    else:
+        effects.append(
+            {
+                "entity": equipment,
+                "status": "out_of_service",
+                "data": equipment_data,
+                "action": "safety_lock",
+                "detail": {"alarm_id": alarm["id"], "already_out_of_service": True},
+            }
+        )
+
+    for permit in [
+        item
+        for item in _all(lookup, "permit")
+        if item["data"].get("equipment_id") == equipment_id
+        and item["status"] in ("pending_review", "granted")
+    ]:
+        permit_data = dict(permit["data"])
+        permit_data.update(
+            {
+                "revoked_reason": "revoked by active alarm " + alarm["id"],
+                "revoked_by_alarm_id": alarm["id"],
+                "revoked_at": _now_iso(),
+            }
+        )
+        effects.append(
+            {
+                "entity": permit,
+                "status": "revoked",
+                "data": permit_data,
+                "action": "revoke",
+                "detail": {"alarm_id": alarm["id"], "automatic": True},
+            }
+        )
+    return effects, equipment
+
+
 def _validate_permit(data, lookup):
-    if not _find_one(lookup, "equipment", "id", data.get("equipment_id")):
+    equipment = _equipment_by_id(lookup, data.get("equipment_id"))
+    if not equipment:
         raise ValidationError("permit requires equipment")
     if data.get("purpose") not in ("return_to_service", "special_inspection", "temporary_operation"):
         raise ValidationError("invalid permit purpose")
+    _require_no_active_alarm(data.get("equipment_id"), lookup, "permit request")
+
+
+def _request_permit_review(actor, entity, data, lookup):
+    _require_no_active_alarm(
+        entity["data"].get("equipment_id"), lookup, "permit request"
+    )
+    return {}, []
 
 
 def _grant_permit(actor, entity, data, lookup):
-    equipment = _find_one(lookup, "equipment", "id", entity["data"].get("equipment_id"))
-    if not equipment or equipment["status"] not in ("in_service", "suspended"):
+    equipment = _equipment_by_id(lookup, entity["data"].get("equipment_id"))
+    if not equipment:
+        raise ConflictError("permit requires equipment")
+    _require_no_active_alarm(equipment["id"], lookup, "permit grant")
+    lock = _safety_lock(equipment)
+    if equipment["status"] == "out_of_service":
+        if entity["data"].get("purpose") != "return_to_service" or not lock.get("requires_recovery"):
+            raise ConflictError("permit can only be granted for a serviceable equipment")
+    elif equipment["status"] not in ("in_service", "suspended"):
         raise ConflictError("permit can only be granted for a serviceable equipment")
-    inspections = [i for i in _all(lookup, "inspection") if i["data"].get("equipment_id") == equipment["id"] and i["status"] == "passed"]
-    if not inspections:
+
+    inspections = [
+        item
+        for item in _all(lookup, "inspection")
+        if item["data"].get("equipment_id") == equipment["id"] and item["status"] == "passed"
+    ]
+    qualified = None
+    required_at = lock.get("recovery_required_at") if lock.get("requires_recovery") else None
+    required_dt = _parse_iso(required_at)
+    for inspection in inspections:
+        passed_at = inspection["data"].get("passed_at")
+        if required_dt and not _parse_iso(passed_at):
+            continue
+        if required_dt and _parse_iso(passed_at) <= required_dt:
+            continue
+        if qualified is None or str(passed_at or "") > str(qualified["data"].get("passed_at", "")):
+            qualified = inspection
+    if not qualified:
+        if required_dt:
+            raise ConflictError("permit requires a passed inspection after alarm closure")
         raise ConflictError("permit requires a passed inspection")
-    if [r for r in _all(lookup, "remediation") if r["data"].get("equipment_id") == equipment["id"] and r["status"] != "closed"]:
+    if [
+        item
+        for item in _all(lookup, "remediation")
+        if item["data"].get("equipment_id") == equipment["id"] and item["status"] != "closed"
+    ]:
         raise ConflictError("permit blocked by open remediation")
-    return {"granted_by": actor.user_id, "granted_at": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
+
+    patch = {
+        "granted_by": actor.user_id,
+        "granted_at": _now_iso(),
+        "qualified_inspection_id": qualified["id"],
+    }
+    effects = []
+    if equipment["status"] == "out_of_service" and entity["data"].get("purpose") == "return_to_service":
+        equipment_data = dict(equipment["data"])
+        released_lock = dict(lock)
+        released_lock.update(
+            {
+                "active": False,
+                "requires_recovery": False,
+                "recovery_alarm_ids": [],
+                "recovered_at": patch["granted_at"],
+                "recovered_by_permit_id": entity["id"],
+            }
+        )
+        equipment_data["safety_lock"] = released_lock
+        effects.append(
+            {
+                "entity": equipment,
+                "status": "in_service",
+                "data": equipment_data,
+                "action": "return_to_service",
+                "detail": {"permit_id": entity["id"], "inspection_id": qualified["id"]},
+            }
+        )
+    return patch, effects
+
+
+def _pass_inspection(actor, entity, data, lookup):
+    passed_at = data.get("passed_at") or _now_iso()
+    if not _parse_iso(passed_at):
+        raise ValidationError("passed_at must be ISO-8601")
+    return {"passed_by": actor.user_id, "passed_at": passed_at}, []
+
+
+def _maintenance_transition(actor, entity, data, lookup):
+    action = "complete" if entity["status"] == "in_progress" else "start"
+    _require_no_active_alarm(
+        entity["data"].get("equipment_id"), lookup, "maintenance " + action
+    )
+    return {}, []
+
+
+def _mark_alarm_false(actor, entity, data, lookup):
+    at = data.get("false_alarm_at") or _now_iso()
+    if not _parse_iso(at):
+        raise ValidationError("false_alarm_at must be ISO-8601")
+    equipment = _equipment_by_id(lookup, entity["data"].get("equipment_id"))
+    if not equipment:
+        raise ConflictError("alarm requires equipment")
+    lock = _safety_lock(equipment)
+    remaining = _active_alarms(lookup, equipment["id"], exclude_id=entity["id"])
+    lock["alarm_ids"] = [alarm_id for alarm_id in lock.get("alarm_ids", []) if alarm_id != entity["id"]]
+    for alarm in remaining:
+        if alarm["id"] not in lock["alarm_ids"]:
+            lock["alarm_ids"].append(alarm["id"])
+    lock["alarm_ids"].sort()
+
+    if remaining:
+        lock["active"] = True
+        equipment_status = "out_of_service"
+        detail = {"alarm_id": entity["id"], "remaining_alarm_ids": lock["alarm_ids"]}
+    else:
+        recovery_ids = lock.get("recovery_alarm_ids", [])
+        needs_recovery = bool(recovery_ids)
+        lock["active"] = False
+        lock["false_alarm_at"] = at
+        if needs_recovery:
+            lock["requires_recovery"] = True
+            lock["recovery_required_at"] = at
+        else:
+            lock.pop("requires_recovery", None)
+            lock.pop("recovery_required_at", None)
+        equipment_status = "out_of_service" if needs_recovery else lock.get("previous_status", "in_service")
+        if equipment_status not in ("in_service", "suspended", "out_of_service"):
+            equipment_status = "in_service"
+        detail = {
+            "alarm_id": entity["id"],
+            "released": not needs_recovery,
+            "recovery_alarm_ids": recovery_ids,
+        }
+
+    equipment_data = dict(equipment["data"])
+    equipment_data["safety_lock"] = lock
+    effects = [
+        {
+            "entity": equipment,
+            "status": equipment_status,
+            "data": equipment_data,
+            "action": "safety_lock_release" if not remaining and not lock.get("requires_recovery") else "safety_lock",
+            "detail": detail,
+        }
+    ]
+    patch = {"marked_false_by": actor.user_id, "false_alarm_at": at}
+    return patch, effects
+
+
+def _close_alarm(actor, entity, data, lookup):
+    jobs = [j for j in _all(lookup, "rescue_job") if j["data"].get("alarm_id") == entity["id"]]
+    if not jobs or any(job["status"] not in ("completed", "aborted") for job in jobs):
+        raise ConflictError("alarm cannot close before rescue jobs are complete")
+    at = data.get("closed_at") or _now_iso()
+    if not _parse_iso(at):
+        raise ValidationError("closed_at must be ISO-8601")
+    equipment = _equipment_by_id(lookup, entity["data"].get("equipment_id"))
+    if not equipment:
+        raise ConflictError("alarm requires equipment")
+    lock = _safety_lock(equipment)
+    remaining = _active_alarms(lookup, equipment["id"], exclude_id=entity["id"])
+    recovery_ids = lock.setdefault("recovery_alarm_ids", [])
+    if entity["id"] not in recovery_ids:
+        recovery_ids.append(entity["id"])
+    recovery_ids.sort()
+    lock["alarm_ids"] = sorted(alarm["id"] for alarm in remaining)
+    if remaining:
+        lock["active"] = True
+        lock.pop("requires_recovery", None)
+        lock.pop("recovery_required_at", None)
+    else:
+        lock["active"] = False
+        lock["requires_recovery"] = True
+        lock["recovery_required_at"] = at
+    equipment_data = dict(equipment["data"])
+    equipment_data["safety_lock"] = lock
+    effects = [
+        {
+            "entity": equipment,
+            "status": "out_of_service",
+            "data": equipment_data,
+            "action": "safety_lock_hold",
+            "detail": {
+                "alarm_id": entity["id"],
+                "requires_qualified_inspection": not bool(remaining),
+                "remaining_alarm_ids": [alarm["id"] for alarm in remaining],
+            },
+        }
+    ]
+    patch = {"closed_by": actor.user_id, "closed_at": at}
+    return patch, effects
 
 
 def _verify_remediation(actor, entity, data, lookup):
     if not entity["data"].get("evidence"):
         raise ValidationError("remediation evidence is required before verification")
-    return {"verified_by": actor.user_id}
-
-
-def _complete_rescue(actor, entity, data, lookup):
-    jobs = [j for j in _all(lookup, "rescue_job") if j["data"].get("alarm_id") == entity["id"]]
-    if not jobs or any(job["status"] not in ("completed", "aborted") for job in jobs):
-        raise ConflictError("alarm cannot close before rescue jobs are complete")
-    return {"resolved_by": actor.user_id}
+    return {"verified_by": actor.user_id}, []
 
 
 class RuleEngine:
@@ -236,9 +546,14 @@ class RuleEngine:
         "permit": lambda a, d, l: _validate_permit(d, l),
     }
     CUSTOM_TRANSITIONS = {
+        ("maintenance", "start"): _maintenance_transition,
+        ("maintenance", "complete"): _maintenance_transition,
+        ("inspection", "pass"): _pass_inspection,
+        ("alarm", "mark_false"): _mark_alarm_false,
+        ("alarm", "close"): _close_alarm,
+        ("permit", "request_review"): _request_permit_review,
         ("permit", "grant"): _grant_permit,
         ("remediation", "verify"): _verify_remediation,
-        ("alarm", "close"): _complete_rescue,
     }
 
     def normalize_kind(self, kind):
@@ -261,6 +576,13 @@ class RuleEngine:
             custom(actor, data, lookup)
         return dict(data)
 
+    def create_side_effects(self, kind, entity, lookup=None):
+        kind = self.normalize_kind(kind)
+        if kind == "alarm":
+            effects, _equipment = _alarm_create_effects(entity["data"].get("equipment_id"), entity, lookup)
+            return effects
+        return []
+
     def validate_transition(self, actor, entity, action, data, lookup=None):
         kind = self.normalize_kind(entity["kind"])
         transition = self.TRANSITIONS.get(kind, {}).get(action)
@@ -273,8 +595,8 @@ class RuleEngine:
         _ensure_role(actor, allowed)
         _require(data, self.ACTION_REQUIRED.get((kind, action), ()))
         custom = self.CUSTOM_TRANSITIONS.get((kind, action))
-        extra = custom(actor, entity, data, lookup) if custom else {}
+        extra, effects = custom(actor, entity, data, lookup) if custom else ({}, [])
         patch = dict(data)
         if extra:
             patch.update(extra)
-        return next_status, patch
+        return next_status, patch, effects
